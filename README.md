@@ -1,6 +1,6 @@
 ---
 title: AUTORE Environment Server
-emoji: \U0001f6a6
+emoji: 🚥
 colorFrom: yellow
 colorTo: purple
 sdk: docker
