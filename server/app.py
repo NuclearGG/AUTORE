@@ -38,10 +38,9 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import AutoreAction, AutoreObservation
     from .AUTORE_environment import AutoreEnvironment
-except ModuleNotFoundError:
+except (ImportError, ModuleNotFoundError):
     from models import AutoreAction, AutoreObservation
     from server.AUTORE_environment import AutoreEnvironment
-
 
 # Create the app with web interface and README integration
 app = create_app(
