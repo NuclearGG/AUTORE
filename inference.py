@@ -9,6 +9,7 @@ MANDATORY REQUIREMENTS (from organizers):
 
 - This file is named `inference.py` and placed in the root directory.
 - All LLM calls use the OpenAI Client with the above variables.
+- Stdout follows the required structured format: START / STEP / END
 """
 
 import os
@@ -16,7 +17,6 @@ import re
 import sys
 import json
 import textwrap
-from typing import Optional
 
 from openai import OpenAI
 
@@ -26,16 +26,16 @@ from models import AutoreAction, AutoreObservation
 from server.AUTORE_environment import AutoreEnvironment, MAX_STEPS
 from tasks import run_all_tasks
 
-# ── Environment configuration (mandatory) ─────────────────────────────────
+# ── Mandatory environment variables ────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://api.openai.com/v1"
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or "EMPTY"
 MODEL_NAME   = os.getenv("MODEL_NAME") or "gpt-4o-mini"
 
 # ── Inference settings ─────────────────────────────────────────────────────
-USE_LLM     = os.getenv("USE_LLM", "0") == "1"
-TEMPERATURE = 0.0
-MAX_TOKENS  = 64
-FALLBACK_SIGNAL = 0   # NS green as safe fallback
+USE_LLM         = os.getenv("USE_LLM", "0") == "1"
+TEMPERATURE     = 0.0
+MAX_TOKENS      = 64
+FALLBACK_SIGNAL = 0
 
 # ── System prompt ──────────────────────────────────────────────────────────
 SYSTEM_PROMPT = textwrap.dedent("""
@@ -58,45 +58,32 @@ def parse_model_signal(response_text: str) -> int:
     """Extract signal (0 or 1) from model response. Falls back to FALLBACK_SIGNAL."""
     if not response_text:
         return FALLBACK_SIGNAL
-
-    # Try structured JSON first
     match = JSON_PATTERN.search(response_text)
     if match:
         try:
-            data = json.loads(match.group(0))
-            return int(data.get("signal", FALLBACK_SIGNAL)) % 2
+            return int(json.loads(match.group(0)).get("signal", FALLBACK_SIGNAL)) % 2
         except (json.JSONDecodeError, ValueError):
             pass
-
-    # Try parsing full response as JSON (model might strip fences)
     clean = response_text.replace("```json", "").replace("```", "").strip()
     try:
-        data = json.loads(clean)
-        return int(data.get("signal", FALLBACK_SIGNAL)) % 2
+        return int(json.loads(clean).get("signal", FALLBACK_SIGNAL)) % 2
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Last resort: look for bare 0 or 1
     for token in re.findall(r"\b[01]\b", response_text):
         return int(token)
-
     return FALLBACK_SIGNAL
 
 
 def build_user_prompt(step: int, obs: AutoreObservation) -> str:
-    """Build a structured text prompt describing the current intersection state."""
     phase_label = {0: "NS (North-South) GREEN", 1: "EW (East-West) GREEN", -1: "YELLOW"}.get(
         obs.phase, "UNKNOWN"
     )
     lane_names = ["North", "South", "East", "West"]
-    if obs.emergency_lane >= 0:
-        emerg_str = (
-            f"EMERGENCY: {lane_names[obs.emergency_lane]} lane has an ambulance — "
-            "MUST be cleared this step!"
-        )
-    else:
-        emerg_str = "No emergency vehicle."
-
+    emerg_str = (
+        f"EMERGENCY: {lane_names[obs.emergency_lane]} lane has an ambulance — MUST be cleared!"
+        if obs.emergency_lane >= 0
+        else "No emergency vehicle."
+    )
     return textwrap.dedent(f"""
         Step: {step}
         Intersection state:
@@ -111,18 +98,10 @@ def build_user_prompt(step: int, obs: AutoreObservation) -> str:
     """).strip()
 
 
-# ── Heuristic policy (no API required) ────────────────────────────────────
+# ── Heuristic policy ───────────────────────────────────────────────────────
 
 def heuristic_policy(obs: AutoreObservation) -> int:
-    """
-    Deterministic rule-based baseline. No API key required.
-
-    Priority:
-      1. Ambulance in N/S → NS green (0)
-      2. Ambulance in E/W → EW green (1)
-      3. More cars on NS  → NS green (0)
-      4. Default (tie)    → NS green (0)  [arterial bias]
-    """
+    """Deterministic rule-based baseline. No API key required."""
     if obs.emergency_lane in (0, 1):
         return 0
     if obs.emergency_lane in (2, 3):
@@ -133,26 +112,14 @@ def heuristic_policy(obs: AutoreObservation) -> int:
 # ── LLM policy ─────────────────────────────────────────────────────────────
 
 def llm_policy_factory(client: OpenAI, model: str):
-    """
-    Returns a policy function that calls the LLM for every step decision.
-    Falls back to heuristic_policy on any API or parse error.
-    """
+    """Returns a policy that calls the LLM each step. Falls back to heuristic on error."""
 
     def _policy(obs: AutoreObservation) -> int:
-        step = getattr(obs, "_step", 0)  # informational only
-        user_prompt = build_user_prompt(step, obs)
-
+        step = getattr(obs, "_step", 0)
         messages = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": SYSTEM_PROMPT}],
-            },
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": user_prompt}],
-            },
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+            {"role": "user",   "content": [{"type": "text", "text": build_user_prompt(step, obs)}]},
         ]
-
         try:
             completion = client.chat.completions.create(
                 model=model,
@@ -163,100 +130,85 @@ def llm_policy_factory(client: OpenAI, model: str):
             )
             response_text = completion.choices[0].message.content or ""
         except Exception as exc:
-            print(f"  [WARN] LLM request failed ({exc}). Using heuristic fallback.")
+            print(f"[WARN] LLM request failed ({exc}). Using heuristic fallback.")
             return heuristic_policy(obs)
-
-        signal = parse_model_signal(response_text)
-        return signal
+        return parse_model_signal(response_text)
 
     return _policy
 
 
-# ── Episode runner ─────────────────────────────────────────────────────────
+# ── Episode runner with START / STEP / END structured logging ─────────────
 
-def run_episode(policy_fn, seed: int = 0, verbose: bool = True) -> float:
-    """Run one full episode. Returns cumulative reward."""
+def run_episode(policy_fn, seed: int = 0, episode: int = 0) -> float:
+    """Run one full episode. Emits START, STEP, and END log lines."""
     env = AutoreEnvironment(seed=seed)
-    result_obs = env.reset()
+    obs = env.reset()
     total_reward = 0.0
 
+    print(f"[START] episode={episode} seed={seed} max_steps={MAX_STEPS}")
+
     for step in range(1, MAX_STEPS + 1):
-        signal = policy_fn(result_obs)
-        result_obs = env.step(AutoreAction(signal=signal))
-        total_reward += result_obs.reward
+        signal = policy_fn(obs)
+        obs = env.step(AutoreAction(signal=signal))
+        total_reward += obs.reward
 
-        if verbose and (step % 20 == 0 or step == 1):
-            phase_str = {0: "NS", 1: "EW", -1: "YL"}.get(result_obs.phase, "??")
-            emerg_flag = f" [EMERG lane={result_obs.emergency_lane}]" if result_obs.emergency_lane >= 0 else ""
-            print(
-                f"  step {step:3d} | "
-                f"N={result_obs.cars_N:2d} S={result_obs.cars_S:2d} "
-                f"E={result_obs.cars_E:2d} W={result_obs.cars_W:2d} | "
-                f"phase={phase_str}{emerg_flag} | "
-                f"reward={result_obs.reward:8.1f}"
-            )
+        print(
+            f"[STEP] episode={episode} step={step} "
+            f"signal={signal} "
+            f"phase={obs.phase} "
+            f"N={obs.cars_N} S={obs.cars_S} E={obs.cars_E} W={obs.cars_W} "
+            f"emergency={obs.emergency_lane} "
+            f"reward={obs.reward:.2f} "
+            f"total_reward={total_reward:.2f} "
+            f"done={obs.done}"
+        )
 
-        if result_obs.done:
-            print("  Episode complete (done flag).")
+        if obs.done:
             break
 
+    print(f"[END] episode={episode} total_reward={total_reward:.2f} steps={env.state.step_count}")
     return total_reward
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> dict:
-    print("=" * 62)
-    print("  AUTORE -- Autonomous Traffic Optimization & Response Engine")
-    print("=" * 62)
+    print("[INFO] AUTORE -- Autonomous Traffic Optimization & Response Engine")
+    print(f"[INFO] API_BASE_URL={API_BASE_URL}")
+    print(f"[INFO] MODEL_NAME={MODEL_NAME}")
+    print(f"[INFO] USE_LLM={USE_LLM}")
 
-    # Build client (always — mirrors reference script structure)
+    # Build OpenAI client (always instantiated per reference script pattern)
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     # Select policy
     if USE_LLM:
-        print(f"\n  Mode      : LLM")
-        print(f"  Endpoint  : {API_BASE_URL}")
-        print(f"  Model     : {MODEL_NAME}")
+        print("[INFO] Mode: LLM")
         policy = llm_policy_factory(client, MODEL_NAME)
     else:
-        print(f"\n  Mode      : Heuristic  (set USE_LLM=1 to enable LLM policy)")
+        print("[INFO] Mode: Heuristic (set USE_LLM=1 to enable LLM policy)")
         policy = heuristic_policy
 
     # Baseline episode
-    print(f"\n{'─'*62}")
-    print("  Baseline Episode  (seed=0)")
-    print(f"{'─'*62}")
-    baseline_reward = run_episode(policy, seed=0, verbose=True)
-    print(f"\n  Baseline Reward : {baseline_reward:.0f}")
+    print("[INFO] Running baseline episode...")
+    baseline_reward = run_episode(policy, seed=0, episode=0)
 
     # Task graders
-    print(f"\n{'─'*62}")
-    print("  Task Graders")
-    print(f"{'─'*62}")
+    print("[INFO] Running task graders...")
     scores = run_all_tasks(policy)
 
     # Summary
-    print(f"\n{'─'*62}")
-    print("  Summary")
-    print(f"{'─'*62}")
-    for task, score in scores.items():
-        filled = int(score * 30)
-        bar = "█" * filled + "░" * (30 - filled)
-        print(f"  {task:6s}  {bar}  {score:.4f}")
+    print("[SCORES] " + json.dumps(scores))
+    print(f"[SCORES] average={sum(scores.values()) / len(scores):.4f}")
+    print(f"[SCORES] baseline_reward={baseline_reward:.2f}")
 
-    avg = sum(scores.values()) / len(scores)
-    print(f"\n  Average score   : {avg:.4f}")
-    print(f"  Baseline Reward : {baseline_reward:.0f}")
-
-    # Validate scores
+    # Validate
     all_valid = all(0.0 <= s <= 1.0 for s in scores.values())
     if not all_valid:
-        print("\n  ERROR: one or more scores outside [0.0, 1.0]")
+        print("[ERROR] One or more scores outside [0.0, 1.0]")
         sys.exit(1)
 
-    print("\n  All scores valid. Ready to submit.")
-    print("=" * 62)
+    print("[INFO] All scores valid. Ready to submit.")
     return scores
 
 
