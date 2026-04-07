@@ -40,7 +40,7 @@ MODEL_NAME   = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 
 TASK_NAME  = os.getenv("AUTORE_TASK", "traffic-signal-control")
 BENCHMARK  = os.getenv("AUTORE_BENCHMARK", "AUTORE")
-MAX_STEPS  = 12
+MAX_STEPS  = 120
 TEMPERATURE = 0.7
 MAX_TOKENS  = 64
 SUCCESS_SCORE_THRESHOLD = 0.3   # normalized score in [0, 1]
@@ -129,18 +129,9 @@ def get_model_signal(client: OpenAI, step: int, obs: AutoreObservation) -> int:
         data = json.loads(text)
         return int(data.get("signal", 0)) % 2
     except Exception as exc:
-        print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        return heuristic_signal(obs)
-
-
-# ── Heuristic fallback ─────────────────────────────────────────────────────
-
-def heuristic_signal(obs: AutoreObservation) -> int:
-    if obs.emergency_lane in (0, 1):
-        return 0
-    if obs.emergency_lane in (2, 3):
-        return 1
-    return 0 if (obs.cars_N + obs.cars_S) >= (obs.cars_E + obs.cars_W) else 1
+        print(f"[CRITICAL ERROR] Model request failed: {exc}", flush=True)
+        # Raise the error to fail loudly so the platform logs capture it
+        raise exc
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -168,15 +159,29 @@ async def main() -> None:
         result = await env.reset()
         obs = result.observation
 
+        # Initialize tracking variables OUTSIDE the loop
+        current_active_signal = 0
+        time_in_phase = 0
+
         for step in range(1, MAX_STEPS + 1):
             if result.done:
                 break
 
-            # Get action from LLM (or heuristic if no API key)
-            if API_KEY:
-                signal = get_model_signal(client, step, obs)
+            # --- ANTI-STARVATION OVERRIDE ---
+            # If the light is green for 8+ steps and there is no ambulance, FORCE a switch
+            if time_in_phase >= 8 and obs.emergency_lane == -1:
+                signal = 1 if current_active_signal == 0 else 0
+                print(f"[DEBUG] Step {step}: Forced switch to prevent lane starvation.", flush=True)
             else:
-                signal = heuristic_signal(obs)
+                # Otherwise, let the LLM decide
+                signal = get_model_signal(client, step, obs)
+
+            # --- UPDATE TRACKERS WITH NEW SIGNAL ---
+            if signal == current_active_signal:
+                time_in_phase += 1
+            else:
+                current_active_signal = signal
+                time_in_phase = 0
 
             action_str = f"signal={signal}"
 
@@ -196,8 +201,6 @@ async def main() -> None:
                 break
 
         # Normalize score to [0, 1]
-        # Best possible reward per step is 0 (empty intersection)
-        # Worst is unbounded negative — use fixed reference range
         total_reward = sum(rewards)
         WORST = -72000.0
         BEST  = -46000.0
@@ -205,7 +208,8 @@ async def main() -> None:
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as e:
-        print(f"[DEBUG] Episode error: {e}", flush=True)
+        print(f"[CRITICAL ERROR] Episode error: {e}", flush=True)
+        raise e # Let the exception crash the run so validator sees it
 
     finally:
         try:
