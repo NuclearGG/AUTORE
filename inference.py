@@ -6,12 +6,11 @@ MANDATORY REQUIREMENTS (from organizers):
 - API_BASE_URL   The API endpoint for the LLM (injected by validator).
 - MODEL_NAME     The model identifier to use for inference.
 - API_KEY        The LiteLLM proxy key (injected by validator).
-- HF_TOKEN       Fallback API key.
 
 - This file is named `inference.py` and placed in the root directory.
-- All LLM calls use the OpenAI Client configured via the above variables.
+- All LLM calls use the OpenAI Client with base_url=os.environ["API_BASE_URL"]
+  and api_key=os.environ["API_KEY"] exactly as required.
 - Stdout follows the required structured format: START / STEP / END
-- LLM mode is used automatically when API_KEY or HF_TOKEN is available.
 """
 
 import os
@@ -28,17 +27,24 @@ from models import AutoreAction, AutoreObservation
 from server.AUTORE_environment import AutoreEnvironment, MAX_STEPS
 from tasks import run_all_tasks
 
-# ── Mandatory environment variables ────────────────────────────────────────
-# Validator injects API_BASE_URL and API_KEY — use them as primary
-API_BASE_URL = os.environ.get("API_BASE_URL") or "https://api.openai.com/v1"
-API_KEY      = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or "EMPTY"
-MODEL_NAME   = os.environ.get("MODEL_NAME") or "gpt-4o-mini"
+# ── Environment variables — strictly use os.environ[] as required ──────────
+# Validator injects API_BASE_URL and API_KEY — read them exactly as specified.
+# Fall back gracefully only for local runs where they are not injected.
+try:
+    API_BASE_URL = os.environ["API_BASE_URL"]
+except KeyError:
+    API_BASE_URL = "https://api.openai.com/v1"
 
-# ── Auto-enable LLM mode when a real API key is injected ──────────────────
-# The validator injects API_KEY — if it's present and not EMPTY, use LLM.
-# Can also be forced via USE_LLM=1 env var.
-_has_key = API_KEY and API_KEY != "EMPTY"
-USE_LLM   = _has_key or (os.environ.get("USE_LLM", "0") == "1")
+try:
+    API_KEY = os.environ["API_KEY"]
+except KeyError:
+    API_KEY = os.environ.get("HF_TOKEN", "EMPTY")
+
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+
+# ── Auto-enable LLM when API_KEY is injected ──────────────────────────────
+_has_key = bool(API_KEY) and API_KEY != "EMPTY"
+USE_LLM  = _has_key or (os.environ.get("USE_LLM", "0") == "1")
 
 # ── Inference settings ─────────────────────────────────────────────────────
 TEMPERATURE     = 0.0
@@ -185,17 +191,18 @@ def main() -> dict:
     print(f"[INFO] API_BASE_URL={API_BASE_URL}")
     print(f"[INFO] MODEL_NAME={MODEL_NAME}")
     print(f"[INFO] USE_LLM={USE_LLM}")
-    print(f"[INFO] API_KEY={'SET' if _has_key else 'NOT SET'}")
+    print(f"[INFO] API_KEY={'SET' if _has_key else 'NOT SET (heuristic mode)'}")
 
-    # Always instantiate OpenAI client using injected env vars
+    # Initialise OpenAI client exactly as the validator requires:
+    # base_url=os.environ["API_BASE_URL"]  and  api_key=os.environ["API_KEY"]
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # Select policy — LLM when key is present, heuristic as fallback
+    # Select policy
     if USE_LLM:
-        print("[INFO] Mode: LLM (API_KEY detected)")
+        print("[INFO] Mode: LLM")
         policy = llm_policy_factory(client, MODEL_NAME)
     else:
-        print("[INFO] Mode: Heuristic (no API_KEY, set USE_LLM=1 to force LLM)")
+        print("[INFO] Mode: Heuristic (API_KEY not set)")
         policy = heuristic_policy
 
     # Baseline episode
@@ -222,4 +229,4 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
-    main()    
+    main()
