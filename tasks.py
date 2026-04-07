@@ -63,7 +63,7 @@ MEDIUM_BEST:  float = -15_000.0
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _clamp(v: float) -> float:
-    return max(0.0, min(1.0, float(v)))
+    return max(0.001, min(0.999, float(v)))
 
 
 def _normalize(value: float, worst: float, best: float) -> float:
@@ -171,7 +171,7 @@ def run_all_tasks(policy_fn) -> dict:
     scores = {}
     for name, grader in TASKS.items():
         score = grader(policy_fn)
-        assert 0.0 <= score <= 1.0, f"Grader '{name}' produced out-of-range score: {score}"
+        assert 0.0 < score < 1.0, f"Grader '{name}' produced out-of-range score: {score}"
         scores[name] = score
         print(f"  [{name:6s}]  score = {score:.4f}")
     return scores
@@ -192,7 +192,7 @@ if __name__ == "__main__":
     scores = run_all_tasks(heuristic_policy)
     avg = sum(scores.values()) / len(scores)
     print(f"\nAverage : {avg:.4f}")
-    all_valid = all(0.0 <= s <= 1.0 for s in scores.values())
+    all_valid = all(0.0 < s < 1.0 for s in scores.values())
     print("Scores in [0,1]:", "OK" if all_valid else "FAIL")
     if not all_valid:
         sys.exit(1)
