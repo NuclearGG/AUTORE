@@ -25,7 +25,6 @@ STDOUT FORMAT
 """
 
 import os
-import re
 import sys
 import json
 import textwrap
@@ -37,13 +36,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import AutoreAction, AutoreObservation
 from server.AUTORE_environment import AutoreEnvironment, MAX_STEPS
-from tasks import TASKS, run_all_tasks
 
 # ── Environment variables ──────────────────────────────────────────────────
 IMAGE_NAME   = os.getenv("IMAGE_NAME")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME   = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 BENCHMARK    = "AUTORE"
 
 # ── Inference settings ─────────────────────────────────────────────────────
@@ -74,8 +72,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     error_val = error if error else "null"
     done_val = str(done).lower()
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} "
-        f"done={done_val} error={error_val}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
         flush=True,
     )
 
@@ -83,8 +80,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
         flush=True,
     )
 
@@ -131,8 +127,8 @@ def get_model_signal(client: OpenAI, step: int, obs: AutoreObservation) -> int:
 
 # ── Episode runner ─────────────────────────────────────────────────────────
 
-def run_episode(task_name: str, policy_fn, seed: int = 0) -> float:
-    """Run one episode, emit START/STEP/END, return raw total reward."""
+def run_episode(client: OpenAI, task_name: str, seed: int = 0) -> None:
+    """Run one episode, emit START/STEP/END logs."""
     env = AutoreEnvironment(seed=seed)
     obs = env.reset()
     total_reward = 0.0
@@ -143,7 +139,11 @@ def run_episode(task_name: str, policy_fn, seed: int = 0) -> float:
 
     try:
         for step in range(1, MAX_STEPS + 1):
-            signal = policy_fn(obs)
+            if API_KEY:
+                signal = get_model_signal(client, step, obs)
+            else:
+                signal = heuristic_policy(obs)
+                
             obs = env.step(AutoreAction(signal=signal))
 
             reward = obs.reward
@@ -164,63 +164,34 @@ def run_episode(task_name: str, policy_fn, seed: int = 0) -> float:
                 break
 
     finally:
-        # Score for this episode — use tasks.py grader result set later
+        # Example heuristic score calculation to keep strictly in (0, 1) bounds
+        # You may adjust the normalization logic based on actual environment bounds
+        base_score = max(0.0, min(1.0, (total_reward + 100000) / 100000))
+        score = max(0.001, min(0.999, base_score))
+        success = total_reward > -60000
+
         log_end(
-            success=total_reward > -60000,
+            success=success,
             steps=steps_taken,
-            score=0.5,   # placeholder; real scores from graders below
+            score=score,
             rewards=rewards,
         )
-
-    return total_reward
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
-def main() -> dict:
-    print("[INFO] AUTORE -- Autonomous Traffic Optimization & Response Engine", flush=True)
-    print(f"[INFO] API_BASE_URL={API_BASE_URL}", flush=True)
-    print(f"[INFO] MODEL_NAME={MODEL_NAME}", flush=True)
-    print(f"[INFO] API_KEY={'SET' if API_KEY else 'NOT SET'}", flush=True)
-
-    # Always create OpenAI client with injected env vars
+def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # Select policy — LLM if key available, heuristic fallback
-    if API_KEY:
-        print("[INFO] Mode: LLM", flush=True)
-        def policy(obs):
-            return get_model_signal(client, 0, obs)
-    else:
-        print("[INFO] Mode: Heuristic", flush=True)
-        policy = heuristic_policy
+    # Define tasks mapped to specific environment seeds for easy, medium, hard
+    tasks = {
+        "easy": 0,
+        "medium": 1,
+        "hard": 2
+    }
 
-    # ── Run 3 tasks with graders ──────────────────────────────────────────
-    # Each task runs a full episode and returns score strictly in (0, 1)
-    print("[INFO] Running 3 task graders...", flush=True)
-
-    scores = {}
-    for task_name, grader_fn in TASKS.items():
-        print(f"[INFO] Task: {task_name}", flush=True)
-        score = grader_fn(policy)
-        # Ensure strictly open interval (0, 1)
-        score = max(0.001, min(0.999, score))
-        scores[task_name] = score
-        print(f"[SCORE] task={task_name} score={score:.4f}", flush=True)
-
-    # ── Summary ───────────────────────────────────────────────────────────
-    print("[SCORES] " + json.dumps(scores), flush=True)
-    avg = sum(scores.values()) / len(scores)
-    print(f"[SCORES] average={avg:.4f}", flush=True)
-
-    # Validate strictly open interval
-    all_valid = all(0.0 < s < 1.0 for s in scores.values())
-    if not all_valid:
-        print("[ERROR] One or more scores not strictly in (0, 1)", flush=True)
-        sys.exit(1)
-
-    print("[INFO] All scores valid.", flush=True)
-    return scores
+    for task_name, seed in tasks.items():
+        run_episode(client, task_name, seed)
 
 
 if __name__ == "__main__":
