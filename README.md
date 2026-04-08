@@ -58,6 +58,6 @@ USE_LLM=1 python inference.py
 ## Environment Variables
 | Variable | Description | Default |
 |----------|-------------|---------|
-| API_BASE_URL | LLM endpoint | https://api.openai.com/v1 |
-| MODEL_NAME | Model identifier | gpt-4o-mini |
+| API_BASE_URL | LLM endpoint | API_BASE_URL |
+| MODEL_NAME | Model identifier | MODEL_NAME |
 | HF_TOKEN | API key | (required for LLM mode) |

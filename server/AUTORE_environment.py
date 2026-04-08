@@ -66,7 +66,7 @@ YELLOW_PENALTY_MULT:    int   = 3
 EMERGENCY_BLOCK_PENALTY: float = 50.0
 
 # Episode length
-MAX_STEPS: int = 120
+MAX_STEPS: int = 8
 
 # Lane indices
 LANE_N, LANE_S, LANE_E, LANE_W = 0, 1, 2, 3
